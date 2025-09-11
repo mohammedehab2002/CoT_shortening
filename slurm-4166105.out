@@ -1,0 +1,5 @@
+/var/spool/slurmd/job4166105/slurm_script: line 6: module: command not found
+Traceback (most recent call last):
+  File "/orcd/home/002/ehab02/CoT_shortening/distributed_label_rewards_random.py", line 20, in <module>
+    with open("rewards_random.jsonl", "r") as f:
+FileNotFoundError: [Errno 2] No such file or directory: 'rewards_random.jsonl'

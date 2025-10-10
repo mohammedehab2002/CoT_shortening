@@ -38,10 +38,11 @@ if __name__ == '__main__':
         p.start()
 
     cnt = 0
-    while cnt < 10000:
+    while cnt < 3000:
         idx = np.random.randint(20000, len(ds))
         if idx not in done:
             task_queue.put((idx,ds[idx]))
+            done.add(idx)
             cnt += 1
             if cnt >= 10000:
                 break

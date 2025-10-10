@@ -1,2 +1,5 @@
 rewards.jsonl
 rewards_random.jsonl
+slurm-*
+checkpoints
+wandb

@@ -6,50 +6,82 @@ class LinearStoppingPolicy(nn.Module):
         self,
         lm,
         lm_tokenizer,
+        device,
     ):
         super().__init__()
         
         self.lm_tokenizer = lm_tokenizer
         self.lm = lm
 
-        self.dtype = lm.dtype
-        self.device = lm.device
+        self.device = device
+        if lm:
+            self.dtype = lm.dtype
+        else:
+            self.dtype = torch.bfloat16
 
-        lm_hidden = self.lm.config.hidden_size
-        # lm_hidden = 5120
+        # lm_hidden = self.lm.config.hidden_size
+        lm_hidden = 5120
 
         self.policy_head = nn.Linear(lm_hidden, 2).to(dtype=self.dtype,device=self.device)
 
         self.grad_params = list(self.policy_head.parameters())
-        self.lm.requires_grad_(False)
+        if self.lm:
+            self.lm.requires_grad_(False)
 
         # Initialize policy_head parameters with fixed values
         # with torch.no_grad():
         #     self.policy_head.weight.copy_(torch.zeros_like(self.policy_head.weight, device=self.device, dtype=self.dtype))
         #     self.policy_head.bias.copy_(torch.tensor([0,-4.40368125271], device=self.device, dtype=self.dtype))
+        
+        self.compute_trainable_state_dict()
 
-    def forward(self, partial_CoT):
+    def forward(self, x):
 
-        model_inputs = self.lm_tokenizer([partial_CoT], return_tensors="pt").to(self.lm.device)
+        if isinstance(x, str):
 
-        lm_out = self.lm.model(**model_inputs)
-        last_hidden = lm_out.last_hidden_state
+            # x = "a" * 100000
 
-        logits = self.policy_head(last_hidden[:,-1,:])
+            model_inputs = self.lm_tokenizer([x], return_tensors="pt").to(self.lm.device)
 
-        return torch.softmax(logits, dim = -1)
+            # print(model_inputs.input_ids.shape[1])
+
+            lm_out = self.lm.model(**model_inputs, use_cache=False)
+            last_hidden = lm_out.last_hidden_state[:,-1,:]
+        
+        else:
+
+            last_hidden = x.to(self.device)
+
+        logits = self.policy_head(last_hidden)
+
+        return logits
+
+    def compute_trainable_state_dict(self):
+        # 1. Get the names of all trainable parameters
+        trainable_param_names = set()
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                trainable_param_names.add(name)
+
+        # 2. Filter the full state_dict to get only the trainable ones
+        full_state_dict = self.state_dict()
+        self.trainable_state_dict = {name: param for name, param in full_state_dict.items() 
+                                if name in trainable_param_names}
     
 class TransformerStoppingPolicy(LinearStoppingPolicy):
     def __init__(
         self,
         lm,
         lm_tokenizer,
+        device,
         num_finetuning_layers=2,
     ):
-        super().__init__(lm, lm_tokenizer)
+        super().__init__(lm, lm_tokenizer, device)
         for layer_num in range(num_finetuning_layers):
             self.lm.model.layers[-layer_num-1].requires_grad_(True)
             self.grad_params.extend(self.lm.model.layers[-layer_num-1].parameters())
+        
+        self.compute_trainable_state_dict()
 
 
 # class BertStoppingPolicy(nn.Module):

@@ -1,0 +1,8 @@
+defaults:
+  - base_config
+  - _self_
+
+model_name: "openai/gpt-oss-20b"
+length_thresh: 15000
+num_finetuning_layers: 1
+dataset: "HENDRYCKS"

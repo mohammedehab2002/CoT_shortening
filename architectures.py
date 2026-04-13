@@ -30,6 +30,7 @@ class TransformerStoppingPolicy(nn.Module):
                 self.policy_head.bias.copy_(torch.tensor([4.40368125271], dtype=self.dtype))
 
         self.cfg = config
+        self.device = self.lm.device
 
     def infer(self, input_ids, attention_mask, indexes):
 

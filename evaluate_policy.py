@@ -6,7 +6,6 @@ import torch.multiprocessing as mp
 from architectures import TransformerStoppingPolicy
 from tqdm import tqdm
 import json
-import wandb
 import random
 import os
 from copy import deepcopy
@@ -38,7 +37,6 @@ if __name__ == '__main__':
         print(config)
 
     loss_type = config.loss.type
-    run_name = get_run_name(config)
 
     lm_tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
@@ -57,14 +55,16 @@ if __name__ == '__main__':
         per_device_eval_batch_size=1,
         fp16=False,
         bf16=True,
+        report_to="none",
     )
 
-    for dataset in ['MATH', 'GSM8K', 'AIME25']:
-        with open(f"evals/{dataset}_{config.model_name.split("/")[-1]}.csv", "a") as f:
+    for dataset in ['MATH', 'GSM8K']:
+        with open(f"vivek_evals/{dataset}_{config.model_name.split("/")[-1]}.csv", "a") as f:
             
-            ds = load_from_disk(f"./datasets/{dataset}_{config.model_name.split("/")[-1]}_corrected")
-            length_baseline = sum(ds['token_count']) / len(ds)
-            accuracy_baseline = sum([labels[-1] for labels in ds['labels']]) / len(ds)
+            if dataset == 'VAL':
+                ds = load_from_disk(f"./stoc_datasets/{config.dataset}_{config.model_name.split('/')[-1]}_rewards")['test']
+            else:
+                ds = load_from_disk(f"./stoc_datasets/{dataset}_{config.model_name.split("/")[-1]}_rewards")
 
             trainer = Trainer(
                 model=model,
@@ -74,7 +74,8 @@ if __name__ == '__main__':
                 compute_metrics=functools.partial(compute_metrics, config=config),
             )
 
-            if config.loss.type == "answer_convergence":
+            if config.loss.type in ["logistic_regression", "answer_convergence"]:
+                run_name = get_run_name(config)
                 run_dir = os.path.join(config.checkpoint_dir, run_name)
                 run_dir = os.path.join(run_dir, os.listdir(run_dir)[-1])
                 model.load_state_dict(load_file(os.path.join(run_dir, "model.safetensors")), strict=False)
@@ -82,18 +83,22 @@ if __name__ == '__main__':
 
                 results = trainer.evaluate()
                 for thresh in [0.7, 0.75, 0.8, 0.85, 0.9, 0.95]:
-                    f.write(f"{config.loss.type},{thresh},{results[f'eval_expected_accuracy_{thresh}']},{results[f'eval_expected_length_{thresh}']},{results[f'eval_expected_length_reduction_{thresh}']},{length_baseline},{accuracy_baseline}\n")
+                    f.write(f"{config.loss.type},{thresh},{results[f'eval_expected_accuracy_{thresh}']},{results[f'eval_expected_length_{thresh}']},{results[f'eval_expected_length_reduction_{thresh}']}\n")
                     f.flush()
             else:
-                f.write("loss,lam,expected_accuracy,expected_length,expected_length_reduction,length_baseline,accuracy_baseline\n")
-                for lam in [0.0001, 0.0002, 0.0003, 0.0004]:
+                length_baseline = sum(ds['token_count']) / len(ds)
+                accuracy_baseline = sum([labels[-1] for labels in ds['labels']]) / len(ds)
+                f.write("loss,lam,expected_accuracy,expected_length,expected_length_reduction\n")
+                f.write(f"baseline,0,{accuracy_baseline},{length_baseline},0\n")
+                for lam in [0.00003]:
 
-                    model = TransformerStoppingPolicy(lm, lm_tokenizer, config)
+                    config.loss.lam = lam
+                    run_name = get_run_name(config)
                     run_dir = os.path.join(config.checkpoint_dir, run_name)
-                    run_dir = os.path.join(run_dir, os.listdir(run_dir)[0])
+                    run_dir = os.path.join(run_dir, os.listdir(run_dir)[-1])
                     model.load_state_dict(load_file(os.path.join(run_dir, "model.safetensors")), strict=False)
                     model.eval()
 
                     results = trainer.evaluate()
-                    f.write(f"{config.loss.type},{lam},{results['eval_expected_accuracy']},{results['eval_expected_length']},{results['eval_expected_length_reduction']},{length_baseline},{accuracy_baseline}\n")
+                    f.write(f"{config.loss.type},{lam},{results['eval_expected_accuracy']},{results['eval_expected_length']},{results['eval_expected_length_reduction']}\n")
                     f.flush()

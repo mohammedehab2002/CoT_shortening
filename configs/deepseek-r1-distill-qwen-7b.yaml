@@ -1,0 +1,8 @@
+defaults:
+  - base_config
+  - _self_
+
+model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+length_thresh: 15000
+num_finetuning_layers: 2
+dataset: "DEEPSCALER"

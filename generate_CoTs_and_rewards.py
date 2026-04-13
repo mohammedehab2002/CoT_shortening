@@ -1,6 +1,5 @@
-from vllm import LLMEngine, EngineArgs, SamplingParams
 import torch
-from datasets import load_dataset, load_from_disk, DatasetDict, get_dataset_config_names, concatenate_datasets
+from datasets import load_dataset, load_from_disk, DatasetDict, get_dataset_config_names, concatenate_datasets, Dataset
 import torch.multiprocessing as mp
 from architectures import TransformerStoppingPolicy
 from tqdm import tqdm
@@ -18,21 +17,21 @@ from omegaconf import OmegaConf
 from transformers import Trainer, TrainingArguments
 from transformers.cache_utils import DynamicCache
 from math_verify import parse, verify
-import sglang as sgl
 import functools
 import gc
 
 stop_tokens = {
-    "gpt-oss-20b": "<|end|>",
+    "gpt-oss-20b": "<|channel|>final",
+    # "gpt-oss-20b": "<|end|>",
     "QwQ-32B-Preview": "</think>",
     "DeepSeek-R1-Distill-Qwen-7B": "</think>",
     "DRPO-7B": "</think>",
 }
 
 system_prompts = {
-    "gpt-oss-20b": "The answer should just be your final answer in \\boxed{} without any explanation or reasoning",
+    "gpt-oss-20b": "Put your final answer in \\boxed{} without any explanation in the answer section.",
     "QwQ-32B-Preview": "You are a helpful assistant. To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The answer should just be your final answer in \\boxed{} without any explanation or reasoning between the <answer> and </answer> tags. Even if you're not sure, only give the final answer.",
-    "DeepSeek-R1-Distill-Qwen-7B": "You are a helpful assistant. To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The answer should just be your final answer in \\boxed{} without any explanation or reasoning between the <answer> and </answer> tags. Even if you're not sure, only give the final answer.",
+    "DeepSeek-R1-Distill-Qwen-7B": "Please reason step by step, and put your final answer within \\boxed{}.", #Provide your final answer as concisely as possible with minimal explanation.",
     "DRPO-7B": "You are a helpful assistant. To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The answer should just be your final answer in \\boxed{} without any explanation or reasoning between the <answer> and </answer> tags. Even if you're not sure, only give the final answer.",
 }
 
@@ -44,13 +43,21 @@ think_triggers = {
 }
 
 answer_triggers = {
-    "gpt-oss-20b": "<|end|><|start|>assistant<|channel|>final<|message|>\\boxed{",
-    "QwQ-32B-Preview": "</think><answer>\\boxed{",
-    "DeepSeek-R1-Distill-Qwen-7B": "</think><answer>\\boxed{",
-    "DRPO-7B": "</think><answer>\\boxed{",
+    "gpt-oss-20b": "<|end|><|start|>assistant<|channel|>final<|message|>The final answer is \\boxed{",
+    "QwQ-32B-Preview": "</think><answer>The final answer is \\boxed{",
+    "DeepSeek-R1-Distill-Qwen-7B": "</think>\nThe final answer is \\boxed{",
+    "DRPO-7B": "</think><answer>The final answer is \\boxed{",
 }
 
-def prep_math_aime25(datapoint):
+flashthink_prompts = {
+    "DeepSeek-R1-Distill-Qwen-7B": "Based on the following question and thought, please judge whether the thought is sufficient to support solving the question. Please directly output yes or no instead of outputting other content.",
+}
+
+end_user = {
+    "DeepSeek-R1-Distill-Qwen-7B": "<｜Assistant｜>",
+}
+
+def prep_math_aime(datapoint):
     return {'ground_truth': datapoint['answer']}
 
 def prep_gsm8k(datapoint):
@@ -95,26 +102,14 @@ def prep_hendrycks(datapoint):
     sol = datapoint['solution']
     return {'ground_truth': extract_answer(sol[sol.rfind('\\boxed{')+7:])}
 
-@sgl.function
-def compute_partial_answers(s, idx, prompt, CoT, max_tokens, model_name):
-    s += prompt
-    paragraphs = CoT.split('\n\n')
-    for idx, paragraph in enumerate(paragraphs+['']):
-        f = s.fork(1)[0]
-        f += answer_triggers[model_name]
-        f += sgl.gen(f"answer", max_tokens=max_tokens)
-        s[f"answer_{idx}"] = f["answer"]
-        if idx == len(paragraphs):
-            break
-        s += paragraph + ("\n\n" if idx < len(paragraphs)-1 else "")
-
 def compute_model_arguments(datapoint, lm_tokenizer, model_name):
     
     CoT = datapoint['CoT']
 
-    messages = [{'role': 'system', 'content': system_prompts[model_name]},
-                {'role': 'user', 'content': datapoint['problem']},
-                ]
+    if model_short == "DeepSeek-R1-Distill-Qwen-7B":
+        messages = [{
+            'role': 'user', 'content': datapoint['problem'] + "\n" + system_prompts[model_short]
+        }]
 
     text = lm_tokenizer.apply_chat_template(
         messages,
@@ -122,10 +117,10 @@ def compute_model_arguments(datapoint, lm_tokenizer, model_name):
         add_generation_prompt=True
     ) + think_triggers[model_name] + CoT
 
-    idx = text.rfind(think_triggers[model_name])+len(think_triggers[model_name])
-    paragraph_ends = [idx]
+    idx = text.rfind(think_triggers[model_name])+len(think_triggers[model_name])-2
+    paragraph_ends = [idx+2]
     while True:
-        idx = text.find('\n\n', idx + 1)
+        idx = text.find('\n\n', idx + 2)
         if idx == -1:
             break
         paragraph_ends.append(idx)
@@ -156,20 +151,22 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, help='Name of the dataset to process')
-    parser.add_argument('--compute_CoT', action='store_true')
+    parser.add_argument('--compute_CoTs', action='store_true')
     parser.add_argument('--compute_rewards', action='store_true')
     parser.add_argument('--compute_model_arguments', action='store_true')
-    parser.add_argument('--model_name', type=str, default='deepseek-ai/DeepSeek-R1-Distill-Qwen-7B')
-    parser.add_argument('--dataset_path', type=str, default='/home/ehab02/datasets/')
-    parser.add_argument('--max_tokens', type=int, default=15000)
+    parser.add_argument('--model_name', type=str, default='openai/gpt-oss-20b')
+    parser.add_argument('--dataset_path', type=str, default='./stoc_datasets/')
+    parser.add_argument('--max_tokens', type=int, default=65536)
     parser.add_argument('-K', type=int, default=1)
     parser.add_argument('--num_samples', type=int)
-    parser.add_argument('--purpose', type=str, default='optimal_stopping')
-    parser.add_argument('--shard', type=int)
+    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--no_rewards', action='store_true')
+    parser.add_argument('--compute_flashthink_labels', action='store_true')
     args = parser.parse_args()
 
     ds_dict = {'MATH':("HuggingFaceH4/MATH-500",),
                "GSM8K":("openai/gsm8k", "main"),
+               "AIME24":("HuggingFaceH4/aime_2024",),
                "AIME25":("yentinglin/aime_2025", "default"),
                "GPQA":("Idavidrein/gpqa", "gpqa_diamond"),
                "DEEPSCALER":("agentica-org/DeepScaleR-Preview-Dataset",)}
@@ -178,28 +175,31 @@ if __name__ == "__main__":
         configs = get_dataset_config_names("EleutherAI/hendrycks_math")
         ds = concatenate_datasets([load_dataset("EleutherAI/hendrycks_math", c)['train'] for c in configs])
     else:
-        ds = load_dataset(*ds_dict[args.dataset])
+        if args.dataset in ds_dict:
+            ds = load_dataset(*ds_dict[args.dataset])
+        else:
+            ds = load_from_disk(f"{args.dataset_path}{args.dataset}")
 
     if args.dataset == 'MATH':
         ds = ds['test']
-        ds = ds.map(prep_math_aime25)
+        ds = ds.map(prep_math_aime)
 
-    if args.dataset == 'AIME25':
+    elif 'AIME' in args.dataset:
         ds = ds['train']
-        ds = ds.map(prep_math_aime25)
+        ds = ds.map(prep_math_aime)
 
-    if args.dataset == 'GSM8K':
+    elif args.dataset == 'GSM8K':
         ds = ds['test']
         ds = ds.map(prep_gsm8k)
 
-    if args.dataset == 'GPQA':
+    elif args.dataset == 'GPQA':
         ds = ds['train']
         ds = ds.map(prep_gpqa)
 
-    if args.dataset == 'HENDRYCKS':
+    elif args.dataset == 'HENDRYCKS':
         ds = ds.map(prep_hendrycks)
 
-    if args.dataset == 'DEEPSCALER':
+    elif args.dataset == 'DEEPSCALER':
         ds = ds['train']
         ds = ds.map(prep_deepscaler)
 
@@ -210,8 +210,16 @@ if __name__ == "__main__":
 
     model_short = args.model_name.split("/")[-1]
 
-    progress_file = f"{args.dataset_path}{args.dataset}_{model_short}{"_"+str(args.shard) if args.shard is not None else ""}.jsonl"
-    if args.compute_CoT:
+    if args.eval:
+        args.K = 16
+
+    ds = Dataset.from_list([item for item in ds for _ in range(args.K)])
+
+    progress_file = f"{args.dataset_path}{args.dataset}_{model_short}.jsonl"
+    if args.compute_CoTs:
+        
+        from vllm import LLMEngine, EngineArgs, SamplingParams
+
         processed_data = {}
 
         if os.path.exists(progress_file):
@@ -224,25 +232,26 @@ if __name__ == "__main__":
 
         engine_args = EngineArgs(args.model_name, max_num_seqs=128, dtype="bfloat16")#, kv_cache_dtype="fp8")
         engine = LLMEngine.from_engine_args(engine_args)
-        if args.purpose == 'optimal_stopping':
-            sampling_params = SamplingParams(stop=[stop_tokens[model_short]], max_tokens=args.max_tokens)
-        else:
-            sampling_params = SamplingParams(temperature=0.5, top_p=0.8, max_tokens=args.max_tokens)
-            set_seed(args.shard)
-
-
-        ds = [item for item in ds for _ in range(args.K)]
         
+        sampling_params = SamplingParams(stop=[stop_tokens[model_short]], max_tokens=args.max_tokens, temperature=1.0, top_p=1.0)
+        # sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.6, top_p=0.95)
+         
         for idx,datapoint in enumerate(tqdm(ds)):
             if idx not in processed_data:
 
-                messages = [{'role': 'system', 'content': system_prompts[model_short]},
-                            {'role': 'user', 'content': datapoint['problem']}]
+                if model_short == "DeepSeek-R1-Distill-Qwen-7B":
+                    messages = [{
+                        'role': 'user', 'content': datapoint['problem'] + "\n" + system_prompts[model_short]
+                    }]
+                else:
+                    messages = [{'role': 'system', 'content': system_prompts[model_short]},
+                               {'role': 'user', 'content': datapoint['problem']}]
                 
                 text = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
+                    # reasoning_effort="high"
                 ) + think_triggers[model_short]
 
                 engine.add_request(str(idx), text, sampling_params)
@@ -270,49 +279,88 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-    if args.purpose == 'O1-pruner':
-        exit()
+    if args.compute_rewards or args.compute_flashthink_labels:
 
-    if args.compute_rewards:
+        import sglang as sgl
+
+        @sgl.function
+        def compute_partial_answers(s, idx, prompt, CoT, max_tokens, model_name):
+            s += prompt
+            paragraphs = CoT.split('\n\n')
+            for idx, paragraph in enumerate(paragraphs+['']):
+                f = s.fork(1)[0]
+                if args.compute_rewards:
+                    f += answer_triggers[model_name]
+                    f += sgl.gen(f"answer", max_tokens=max_tokens, temperature=1.0, top_p=1.0)
+                else:
+                    f += end_user[model_name]
+                    f += sgl.gen(f"answer", max_tokens=max_tokens, temperature=0.0, top_p=1.0)
+                s[f"answer_{idx}"] = f["answer"]
+                if idx == len(paragraphs):
+                    break
+                s += paragraph + ("\n\n" if idx < len(paragraphs)-1 else "")
 
         CoTs = {}
 
         with open(progress_file, "r") as f:
             all_results = [json.loads(line) for line in f if line.strip()]
             for result in all_results:
-                CoTs[int(result['idx'])] = result['CoT']
+                CoTs[int(result['idx'])] = result['CoT'][:result['CoT'].find(stop_tokens[model_short])]
 
-        if model_short == "gpt-oss-20b":
-            runtime = sgl.Runtime(model_path="openai/gpt-oss-20b", reasoning_parser="gpt-oss")
+        if args.compute_rewards:
+            if model_short == "gpt-oss-20b":
+                runtime = sgl.Runtime(model_path="openai/gpt-oss-20b", reasoning_parser="gpt-oss", dp_size=torch.cuda.device_count())
+            else:
+                runtime = sgl.Runtime(model_path=args.model_name, dtype="bfloat16", dp_size=torch.cuda.device_count())
         else:
-            runtime = sgl.Runtime(model_path=args.model_name)
+            runtime = sgl.Runtime(model_path="Qwen/Qwen2.5-7B-Instruct", dtype="bfloat16", dp_size=torch.cuda.device_count())
         sgl.set_default_backend(runtime)
 
         sgl_dataset = []
         final_ids = []
         all_CoTs = []
+        all_finish_reasons = []
 
         for result in all_results:
-            if result["finish_reason"] != "stop":
-                continue
+            # if result["finish_reason"] != "stop":
+            #     continue
             idx = int(result["idx"])
             CoT = result["CoT"]
             all_CoTs.append(CoT)
+            all_finish_reasons.append(result["finish_reason"])
 
             datapoint = ds[idx]
 
             datapoint["system"] = system_prompts[model_short]
 
-            messages = [{'role': 'system', 'content': datapoint['system']},
-                        {'role': 'user', 'content': datapoint['problem']}]
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            ) + think_triggers[model_short]
+            if args.compute_rewards:
+                if model_short == "DeepSeek-R1-Distill-Qwen-7B":
+                    messages = [{
+                        'role': 'user', 'content': datapoint['problem'] + "\n" + system_prompts[model_short]
+                    }]
+                else:
+                    messages = [{'role': 'system', 'content': system_prompts[model_short]},
+                            {'role': 'user', 'content': datapoint['problem']}]
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                ) + think_triggers[model_short]
 
-            gt = datapoint['ground_truth']
-            token_limit = 2 * tokenizer([gt], return_tensors="pt").input_ids.shape[1] + 5
+                gt = datapoint['ground_truth']
+                token_limit = 2 * tokenizer([gt], return_tensors="pt").input_ids.shape[1] + 5
+
+            else:
+                messages = [{
+                    'role': 'system', 'content': "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+                    'role': 'user', 'content': flashthink_prompts[model_short] + "\n### Question: " + datapoint['problem'] + "\n### Thought: "
+                }]
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                token_limit = 2
 
             sgl_dataset.append({
                 "idx": idx,
@@ -345,8 +393,8 @@ if __name__ == "__main__":
 
         #     all_outputs.append(outputs)
         #     all_labels.append(labels)
-        BATCH_SIZE = 1024
-        progress_file = f"{args.dataset_path}{args.dataset}_{model_short}_rewards{"_"+str(args.shard) if args.shard is not None else ""}.jsonl"
+        BATCH_SIZE = 512
+        progress_file = f"{args.dataset_path}{args.dataset}_{model_short}_{"rewards" if args.compute_rewards else "flashthink"}.jsonl"
         if os.path.exists(progress_file):
             with open(progress_file, 'r') as f:
                 for line in f:
@@ -361,7 +409,7 @@ if __name__ == "__main__":
             # Run SGLang on the current chunk
             states = compute_partial_answers.run_batch(
                 batch_subset,
-                num_threads=256
+                num_threads=BATCH_SIZE
             )
 
             batch_results = []
@@ -379,9 +427,12 @@ if __name__ == "__main__":
                     outputs.append(raw_output)
                     
                     # Processing logic
-                    answer = '\(' + extract_answer(raw_output) + '\)'
-                    gt = '\(' + ds[int(sgl_dataset[absolute_idx]['idx'])]['ground_truth'] + '\)'
-                    labels.append(verify(parse(answer), parse(gt)))
+                    if args.compute_rewards:
+                        answer = '\\(' + extract_answer(raw_output) + '\\)'
+                        gt = '\\(' + ds[int(sgl_dataset[absolute_idx]['idx'])]['ground_truth'] + '\\)'
+                        labels.append(verify(parse(answer), parse(gt)))
+                    else:
+                        labels.append("Yes" in raw_output or "yes" in raw_output)
 
                 # Create a result object for this specific item
                 result_item = {
@@ -405,20 +456,41 @@ if __name__ == "__main__":
         ds = ds.add_column("CoT", all_CoTs)
         ds = ds.add_column("outputs", all_outputs)
         ds = ds.add_column("labels", all_labels)
+        ds = ds.add_column("finish_reason", all_finish_reasons)
 
-        ds.save_to_disk(f"{args.dataset_path}{args.dataset}_{model_short}")
+        print(f"Saving to {args.dataset_path}{args.dataset}_{model_short}{"_flashthink" if args.compute_flashthink_labels else ""}")
+
+        ds.save_to_disk(f"{args.dataset_path}{args.dataset}_{model_short}{"_flashthink" if args.compute_flashthink_labels else ""}")
 
     if args.compute_model_arguments:
 
-        ds = load_from_disk(f"{args.dataset_path}{args.dataset}_{model_short}")
+        if not args.no_rewards:
+            ds = load_from_disk(f"{args.dataset_path}{args.dataset}_{model_short}")
+        # else:
+        #     new_ds = []
+        #     with open(progress_file, "r") as f:
+        #         for line in f:
+        #             if not line.strip():
+        #                 continue
+        #             entry = json.loads(line)
+        #             idx = int(entry["idx"])
+        #             datapoint = ds[idx]
+        #             datapoint["CoT"] = entry["CoT"]
+        #             datapoint["finish_reason"] = entry["finish_reason"]
+        #             new_ds.append(datapoint)
+        #     ds = Dataset.from_list(new_ds)
 
         ds = ds.map(functools.partial(compute_model_arguments, lm_tokenizer=tokenizer, model_name=model_short), num_proc=19)
-        ds = ds.filter(lambda row: len(row['indexes'])==len(row['labels']))
-        ds.save_to_disk(f"{args.dataset_path}{args.dataset}_{model_short}_corrected")
-        
-        print("Baseline token count:", sum(ds['token_count'])/len(ds))
-        print("Baseline accuracy:", sum([int(labels[-1]) for labels in ds['labels']])/len(ds))
-        print("Baseline no thinking accuracy:", sum([int(labels[0]) for labels in ds['labels']])/len(ds))
-        ds = ds.filter(lambda example: example['labels'][-1] is True)
-        print("Theoretical optimal number of tokens:", sum([datapoint['indexes'][datapoint['labels'].index(True)]-datapoint['indexes'][0] for datapoint in ds]) / len(ds))
-        print("Baseline length for only correct answers:", sum(ds['token_count'])/len(ds))
+        ds = ds.filter(lambda row: len(row['indexes']) == len(row['labels']))
+        if not args.eval:
+            ds = ds.train_test_split(test_size=500, seed=42)
+        ds.save_to_disk(f"{args.dataset_path}{args.dataset}_{model_short}_{"corrected" if args.no_rewards else "rewards"}")
+
+        if not args.eval:
+            ds = ds['test']
+            print("Baseline token count:", sum(ds['token_count'])/len(ds))
+            print("Baseline accuracy:", sum([int(labels[-1]) for labels in ds['labels']])/len(ds))
+            print("Baseline no thinking accuracy:", sum([int(labels[0]) for labels in ds['labels']])/len(ds))
+            ds = ds.filter(lambda example: example['labels'][-1] is True)
+            print("Theoretical optimal number of tokens:", sum([datapoint['indexes'][datapoint['labels'].index(True)]-datapoint['indexes'][0] for datapoint in ds]) / len(ds))
+            print("Baseline length for only correct answers:", sum(ds['token_count'])/len(ds))

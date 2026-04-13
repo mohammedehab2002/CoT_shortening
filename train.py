@@ -85,10 +85,13 @@ if __name__ == '__main__':
         print("Loading",resume_checkpoint)
         model.load_state_dict(load_file(resume_checkpoint), strict=False)
 
-    ds = load_from_disk(f"./datasets/{config.dataset}_{config.model_name.split('/')[-1]}_corrected")
-    ds = ds.train_test_split(test_size=500, seed=42)
-
+    ds = load_from_disk(f"./stoc_datasets/{config.dataset}_{config.model_name.split('/')[-1]}_rewards")
     ds = ds.filter(lambda row: row['token_count'] <= config.length_thresh)
+    # ds = ds.filter(lambda row: (row['labels'].index(True) if True in row['labels'] else 10)>=10)
+    # print("Dataset size:", len(ds['train']))
+    # print("Baseline token count:", sum(ds['test']['token_count'])/len(ds['test']))
+    # print("Baseline accuracy:", sum([int(labels[-1]) for labels in ds['test']['labels']])/len(ds['test']))
+    # print("Baseline no thinking accuracy:", sum([int(labels[0]) for labels in ds['test']['labels']])/len(ds['test']))
 
     if config.loss.type == "answer_convergence":
         ds = ds.map(compute_answer_convergence_labels)

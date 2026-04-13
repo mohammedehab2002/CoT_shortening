@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import random
 
 def extract_answer(out):
 
@@ -36,7 +37,7 @@ def compute_metrics_one_datapoint(logits, indexes, labels, config):
             idx = list(mask).index(True) if True in mask else len(probs) - 1
             ret[f"expected_accuracy_{thresh}"] = int(labels[idx])
             ret[f"expected_length_{thresh}"] = (indexes[idx] - indexes[0])
-            ret[f"expected_length_reduction_{thresh}"] = 1 - ((indexes[idx] - indexes[0]) / (indexes[-1] - indexes[0]))
+            ret[f"expected_length_reduction_{thresh}"] = 1 - ((indexes[idx] - indexes[0]) / max(indexes[-1] - indexes[0], 1))
         return ret
 
     expected_accuracy = torch.tensor(0.0, device=logits.device)
@@ -57,7 +58,7 @@ def compute_metrics_one_datapoint(logits, indexes, labels, config):
                     stop_prob = con_prob - torch.min(con_prob, probs[j])
         expected_accuracy += stop_prob * int(labels[j])
         expected_length += stop_prob * (indexes[j] - indexes[0])
-        expected_length_percentage += stop_prob * ((indexes[j] - indexes[0]) / (indexes[-1] - indexes[0]))
+        expected_length_percentage += stop_prob * ((indexes[j] - indexes[0]) / max(indexes[-1] - indexes[0], 1))
         if config.loss.type == "optimal_stopping":
             con_prob = con_prob * probs[j]
         elif config.loss.type == "optimal_stopping_pre":
@@ -98,3 +99,19 @@ def compute_metrics(eval_pred, config):
         aggregated_metrics[k] /= len(lens)
     
     return aggregated_metrics
+
+def sample_stopping_point(row, model, config):
+
+    logits = model.infer(torch.tensor(row['input_ids'], device=model.device).unsqueeze(0),
+                         torch.tensor(row['attention_mask'], device=model.device).unsqueeze(0),
+                         torch.tensor(row['indexes'], device=model.device))
+    probs = torch.sigmoid(logits)
+    for j in range(len(probs)):
+        if config.loss.type == "optimal_stopping":
+            if probs[j] < random.random():
+                return j
+        elif config.loss.type == "answer_convergence":
+            if probs[j] >= config.loss.lam:
+                return j
+                
+    return len(probs) - 1
